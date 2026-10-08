@@ -3,11 +3,11 @@
 #
 #   prompt   UserPromptSubmit: "/grindstone:on [task]" turns Grindstone on, "/grindstone:off" turns it off
 #   guard    PreToolUse: blocks changes outside the project folder while on
-#   stop     Stop: while on, sends Claude into its next work or review cycle
+#   stop     Stop: while on, sends Claude into its next work, review or discovery cycle
 #   failure  StopFailure (asyncRewake): after a usage/rate limit, waits, then wakes Claude
 #   end      SessionEnd: clears the session's state
 #
-# Per-session state: $DATA/sessions/<session_id>/{root,notes,base,count,lens,mtime,stale}
+# Per-session state: $DATA/sessions/<session_id>/{root,notes,base,mode,count,lens,mtime,head,stale}
 
 RES="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 DATA="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/grindstone-data}"
@@ -48,10 +48,16 @@ else
   done < <(tr ',\n' '\n\n' <<<"$EXTRA_RAW")
 fi
 
+# Stuck handling: nudge after STUCK_NUDGE cycles without progress (no notes
+# update and no new commit), pause Grindstone after STUCK_PAUSE.
+STUCK_NUDGE=4
+STUCK_PAUSE=8
+
 # Review lenses, rotated one per review cycle. "Name|what to look at".
 LENSES=(
   "Fresh-eyes goal check|Read the full diff since the base commit the way a strict reviewer seeing it for the first time would. Are the acceptance criteria really met, with evidence? Any regressions or leftovers?"
   "Correctness & edge cases|Try to break the main flows: empty, huge, malformed and unexpected input, failure paths, boundaries, concurrency."
+  "Product & features|What would make this more useful to the people who use it? Check the roadmap, open issues, TODOs, promises in the README and gaps in the main workflows. Write up to two feature plans following the playbook's Feature planning section, and add them to the Backlog with honest scores."
   "Tests & verification|Which critical paths have no tests? Are any tests flaky, or passing for the wrong reason? Can the whole thing be verified with one command?"
   "User experience|Use it the way a first-time user would. Look at error messages, empty and loading states, wording, accessibility, and anything confusing or slow."
   "Code quality|Look for duplication, unclear names, dead code, long functions and wrong abstractions. Find the most complex part and see whether it can be simpler."
@@ -70,6 +76,7 @@ S="$SESSIONS/$SESSION_ID"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SESSION_ID:0:8} $*" >>"$LOG"; }
 get() { cat "$S/$1" 2>/dev/null || echo "$2"; }
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+git_head() { git -C "$1" rev-parse HEAD 2>/dev/null || echo none; }
 
 # ---------------------------------------------------------------- path guard
 
@@ -156,7 +163,10 @@ command_heads() {
 }
 
 HARD_RE='(^|[^[:alnum:]_./-])(sudo|doas|launchctl|crontab|systemctl|systemsetup|scutil|diskutil|csrutil|nvram|shutdown|reboot|halt)([[:space:]]|$)|(^|[^[:alnum:]_-])defaults[[:space:]]+(write|delete)|(npm|pnpm)[[:space:]][^;&|]*[[:space:]](-g|--global)([[:space:]]|$)|yarn[[:space:]]+global|brew[[:space:]]+(install|uninstall|remove|rm|upgrade|reinstall|link|unlink|tap|untap|services|cleanup)|(apt|apt-get|dnf|yum|pacman|zypper|snap)[[:space:]]+(install|remove|purge|upgrade|-S)|pip3?[[:space:]]+install[^;&|]*(--user|--break-system-packages)|(cargo|go|gem)[[:space:]]+install'
-REMOTE_RE='git([[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+|-[^[:space:]]+))*[[:space:]]+push([[:space:]]|$)|gh[[:space:]]+(pr|repo|release|issue|gist|api|workflow)[[:space:]]|(npm|pnpm|yarn)[[:space:]]+publish'
+# Reaching out to remote services. Reading (gh issue list, gh pr view, gh api GETs) is allowed.
+REMOTE_RE='git([[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+|-[^[:space:]]+))*[[:space:]]+push([[:space:]]|$)|gh[[:space:]]+(pr[[:space:]]+(create|merge|close|reopen|comment|review|edit|ready|lock|unlock)|issue[[:space:]]+(create|close|reopen|comment|edit|delete|transfer|lock|unlock|pin|unpin|develop)|release[[:space:]]+(create|delete|delete-asset|edit|upload)|repo[[:space:]]+(create|delete|edit|fork|rename|archive|unarchive|sync|set-default|deploy-key)|gist[[:space:]]+(create|edit|delete|rename)|workflow[[:space:]]+(run|enable|disable)|run[[:space:]]+(rerun|cancel|delete)|label[[:space:]]+(create|edit|delete|clone)|secret|variable|ssh-key|gpg-key|auth)([[:space:]]|$)|gh[[:space:]]+api[^;&|]*[[:space:]](-X|--method)[[:space:]=]*\"?(POST|PUT|PATCH|DELETE|post|put|patch|delete)|gh[[:space:]]+api[^;&|]*[[:space:]](-f|-F|--field|--raw-field|--input)([[:space:]=]|$)|(npm|pnpm|yarn)[[:space:]]+publish'
+# Git commands that can throw away uncommitted or unpushed work.
+DESTRUCTIVE_RE='git([[:space:]]+-[^[:space:]]+)*[[:space:]]+(reset[[:space:]]+([^;&|]*[[:space:]])?--hard|clean[[:space:]]+([^;&|]*[[:space:]])?-[a-zA-Z]*f|checkout[[:space:]]+(--[[:space:]]+)?\.([[:space:]]|$)|restore[[:space:]]+([^;&|]*[[:space:]])?\.([[:space:]]|$)|stash[[:space:]]+(drop|clear)|branch[[:space:]]+([^;&|]*[[:space:]])?-D)'
 READONLY_RE='^(cat|head|tail|less|more|ls|grep|egrep|fgrep|rg|ag|find|fd|wc|diff|cmp|stat|file|which|type|whereis|pwd|realpath|readlink|du|df|tree|sort|uniq|cut|tr|awk|sed|jq|yq|basename|dirname|test|\[|\[\[|echo|printf|true|false|date|md5|md5sum|shasum|sha256sum|xxd|hexdump|strings|nl|column|comm|paste|fold|rev|tac|od)$'
 WRITEFLAG_RE='(^|[[:space:]])(-delete|-exec|-execdir|-ok|-okdir|-fprint|-fprint0|-fprintf|-fls|--in-place)([[:space:]=]|$)|sed[[:space:]]([^|;&]*[[:space:]])?-[a-zA-Z]*i([[:space:]]|$)|system[[:space:]]*\('
 
@@ -167,7 +177,10 @@ check_shell() {
     echo "\`${BASH_REMATCH[0]# }\` changes the system or global packages"; return
   fi
   if [ "$ALLOW_REMOTE" != yes ] && [[ "$c" =~ $REMOTE_RE ]]; then
-    echo "\`${BASH_REMATCH[0]}\` reaches a remote service (commit locally instead)"; return
+    echo "\`${BASH_REMATCH[0]}\` changes something on a remote service (reading is fine; commit locally instead of pushing)"; return
+  fi
+  if [[ "$c" =~ $DESTRUCTIVE_RE ]]; then
+    echo "\`${BASH_REMATCH[0]}\` can throw away uncommitted work (undo specific files or use git revert instead)"; return
   fi
   if [[ "$c" =~ (^|[;&|(])[[:space:]]*cd[[:space:]]*($|[;&|)]) ]]; then
     echo "a bare \`cd\` moves to the home folder"; return
@@ -206,7 +219,7 @@ check_shell() {
 
 deny() {
   log "GUARD blocked $tool: $1"
-  jq -nc --arg r "Grindstone guard: blocked because $1. While Grindstone is on you may only change things inside the project folder ($ROOT). Find a way to do this inside the project. If that isn't possible, add it to 'Blocked / Questions for the user' in your notes and move on to other work." \
+  jq -nc --arg r "Grindstone guard: blocked because $1. While Grindstone is on you may only change things inside the project folder ($ROOT), and never in ways that destroy the user's work. Find a way to do this inside those limits. If that isn't possible, add it to 'Blocked / Questions for the user' in your notes and move on to other work." \
     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
   exit 0
 }
@@ -266,6 +279,88 @@ guard() {
   fi
 }
 
+# ---------------------------------------------------------------- discovery
+
+# Did the conversation have real user messages before this /grindstone:on?
+had_conversation() {
+  local t; t="$(jq -r '.transcript_path // empty' <<<"$INPUT")"
+  [ -f "$t" ] || return 1
+  jq -r 'select(.type == "user") | .message.content
+         | if type == "string" then . else (map(select(.type == "text") | .text) | join(" ")) end' "$t" 2>/dev/null \
+    | grep -vE '^[[:space:]]*(/grindstone|<|$)' | grep -q .
+}
+
+# Project files, relative to $1, skipping dependency and build folders. Uses git when possible.
+project_files() {
+  if git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$1" ls-files --cached --others --exclude-standard 2>/dev/null
+  else
+    (cd "$1" && find . -maxdepth 4 \( -name node_modules -o -name .git -o -name vendor -o -name dist -o -name build \
+       -o -name target -o -name .venv -o -name venv -o -name __pycache__ -o -name .claude \) -prune -o -type f -print 2>/dev/null \
+       | sed 's#^\./##')
+  fi
+}
+
+# A short, bounded survey of the project for self-directed planning. Prints plain text lines.
+survey() {
+  local r="$1" files n f list prev scripts
+  files="$(project_files "$r" | grep -v '^\.claude/grindstone/' | head -20000)"
+  n=$(grep -c . <<<"$files")
+  if (( n == 0 )); then
+    echo "- The project folder is empty. There is nothing to improve yet: unless the conversation says what to build, set Status: idle with that reason."
+    return
+  fi
+  echo "- $n files."
+
+  prev="$(ls -t "$r"/.claude/grindstone/notes-*.md 2>/dev/null | grep -v "/notes-${SESSION_ID:0:8}\.md$" | head -3)"
+  if [ -n "$prev" ]; then
+    echo "- Earlier Grindstone notes (newest first). Check their Backlog, Feature plans and Questions before anything else:"
+    while IFS= read -r f; do
+      echo "  - ${f#"$r"/}: $(grep -m1 '^Status:' "$f" | sed 's/^Status:[[:space:]]*//'), $(grep -cE '^\|[[:space:]]*P[0-9]' "$f") backlog items"
+    done <<<"$prev"
+  fi
+
+  list="$(grep -iE '(^|/)(todo|roadmap|tasks?|backlog|plans?|ideas|changelog)[^/]*$|\.todo$' <<<"$files" | grep -vE '(^|/)(node_modules|vendor)/' | head -8 | tr '\n' ' ')"
+  [ -n "$list" ] && echo "- Task, roadmap and changelog files: $list"
+
+  list="$(grep -iE '(^|/)(CLAUDE|AGENTS|CONTRIBUTING|\.cursorrules|copilot-instructions)[^/]*$' <<<"$files" | head -5 | tr '\n' ' ')"
+  [ -n "$list" ] && echo "- Conventions to follow: $list"
+
+  list=""
+  for f in package.json pyproject.toml setup.py requirements.txt Cargo.toml go.mod Gemfile pom.xml build.gradle build.gradle.kts \
+           Package.swift composer.json mix.exs deno.json project.godot CMakeLists.txt Makefile justfile; do
+    grep -qxF "$f" <<<"$files" && list+="$f "
+  done
+  [ -n "$list" ] && echo "- Project manifests: $list"
+  if grep -qxF package.json <<<"$files"; then
+    scripts="$(jq -r '.scripts // {} | keys | join(", ")' "$r/package.json" 2>/dev/null)"
+    [ -n "$scripts" ] && echo "- npm scripts: $scripts"
+  fi
+  if grep -qxF Makefile <<<"$files"; then
+    scripts="$(grep -oE '^[A-Za-z0-9_-]+:' "$r/Makefile" | tr -d : | head -12 | tr '\n' ' ')"
+    [ -n "$scripts" ] && echo "- Make targets: $scripts"
+  fi
+
+  n=$(grep -ciE '(^|/)(tests?|__tests__|spec)/|[._-](test|spec)\.[a-z]+$|_test\.go$|^test_' <<<"$files")
+  echo "- Test files: $n"
+
+  list="$(cd "$r" && grep -v '^\.claude/' <<<"$files" | head -5000 | tr '\n' '\0' \
+          | xargs -0 grep -IcE '\b(TODO|FIXME|HACK|XXX)\b' 2>/dev/null | grep -v ':0$' | sort -t: -k2 -nr | head -5)"
+  if [ -n "$list" ]; then
+    n=$(awk -F: '{ s += $NF } END { print s }' <<<"$list")
+    echo "- TODO/FIXME/HACK markers in the top files: $n ($(tr '\n' ' ' <<<"$list"))"
+  fi
+
+  if git -C "$r" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "- Git: branch $(git -C "$r" branch --show-current 2>/dev/null), last commit $(git -C "$r" log -1 --format='%cr: %s' 2>/dev/null | cut -c1-80)"
+    if git -C "$r" remote get-url origin 2>/dev/null | grep -q github.com && command -v gh >/dev/null 2>&1; then
+      echo "- The repo is on GitHub: open issues and PRs can be read with \`gh issue list\` / \`gh pr list\` (reading is allowed; changing them isn't)."
+    fi
+  else
+    echo "- Not a git repository, so changes can't be committed or easily undone. Keep each change small and record exactly what you changed in the notes."
+  fi
+}
+
 # ---------------------------------------------------------------- events
 
 case "$1" in
@@ -275,7 +370,8 @@ case "$1" in
     [[ "$TEXT" =~ $CMD_RE ]] || exit 0
     VERB="${BASH_REMATCH[1]}"
     TASK="$(sed -E '1s#^[[:space:]]*/grindstone(:on|:off|:grindstone)?[[:space:]]*##' <<<"$TEXT")"
-    if [ "$VERB" = :off ] || [[ "$(tr '[:upper:]' '[:lower:]' <<<"$TASK" | xargs)" =~ ^(off|stop|disable)$ ]]; then
+    WORD="$(tr -d '[:space:]' <<<"$TASK" | tr '[:upper:]' '[:lower:]')"
+    if [ "$VERB" = :off ] || [[ "$WORD" =~ ^(off|stop|disable)$ ]]; then
       rm -rf "$S"
       log "OFF"
       exit 0
@@ -290,30 +386,62 @@ case "$1" in
       exit 0
     fi
 
+    if [[ "$TASK" =~ [^[:space:]] ]]; then
+      MODE=task
+      MODE_TEXT="Task given"
+      HOW="Plan and work on the task."
+    elif had_conversation; then
+      MODE=conversation
+      MODE_TEXT="Continuing the conversation's task"
+      HOW="No task was given with the command, but this chat has earlier messages. If they contain a clear task, restate it as the Goal and continue it. If they don't, follow the playbook's Discovery mode."
+    else
+      MODE=discover
+      MODE_TEXT="Self-directed (Discovery mode)"
+      HOW="No task was given and the chat has no earlier messages. Follow the playbook's Discovery mode: survey the project, choose a mission (fixes, health work or a planned feature), and write it up as the Goal."
+    fi
+
     NOTES="$ROOT/.claude/grindstone/notes-${SESSION_ID:0:8}.md"
     BASE="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo none)"
+    DIRTY="$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -v '\.claude/grindstone/' | head -40 | sed -E 's/^(..) /- `\1` /')"
     mkdir -p "$S" "$(dirname "$NOTES")"
     echo "$ROOT" >"$S/root"
     echo "$NOTES" >"$S/notes"
     echo "$BASE" >"$S/base"
+    echo "$MODE" >"$S/mode"
+    git_head "$ROOT" >"$S/head"
     echo 0 >"$S/count"; echo 0 >"$S/lens"; echo 0 >"$S/stale"
 
     if [ -f "$NOTES" ]; then
       STATE="Your notes file already exists. If the task has changed, update the Goal and acceptance criteria and re-plan the Backlog."
     else
-      [ -z "$TASK" ] && TASK="(Take this from the conversation and restate it here.)"
+      case "$MODE" in
+        task) GOAL="$TASK" ;;
+        conversation) GOAL="(Take this from the conversation and restate it here. If there's no clear task, follow Discovery mode.)" ;;
+        discover) GOAL="(Self-directed. Choose a mission in the planning cycle; see Discovery mode in the playbook.)" ;;
+      esac
       T="$(cat "$TEMPLATE")"
-      T="${T//__TASK__/$TASK}"
+      T="${T//__TASK__/$GOAL}"
+      T="${T//__MODE__/$MODE_TEXT}"
       T="${T//__STARTED__/$(date '+%Y-%m-%d %H:%M')}"
       T="${T//__BASE__/$BASE}"
       T="${T//__ROOT__/$ROOT}"
+      T="${T//__DIRTY__/${DIRTY:-None.}}"
       printf '%s\n' "$T" >"$NOTES"
       STATE="A notes file has been created from the template. Fill it in during planning."
     fi
     mtime "$NOTES" >"$S/mtime"
-    log "ON (base $BASE)"
-    jq -nc --arg c "Grindstone is ON for this session. Project folder: $ROOT (a guard blocks changes outside it). Playbook: $PLAYBOOK. Notes: $NOTES. $STATE" \
-      '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $c}}'
+
+    CTX="Grindstone is ON for this session. Mode: $MODE_TEXT. $HOW Project folder: $ROOT (a guard blocks changes outside it). Playbook: $PLAYBOOK. Notes: $NOTES. $STATE"
+    if [ -n "$DIRTY" ]; then
+      CTX="$CTX The project already had uncommitted changes when Grindstone started (listed in the notes under Pre-existing changes). They are the user's work in progress: don't edit, revert or commit those files, and stage your own files by name instead of using \`git add -A\`."
+    fi
+    if [ "$MODE" != task ]; then
+      CTX="$CTX
+Project survey:
+$(survey "$ROOT")"
+    fi
+    log "ON mode=$MODE (base $BASE)"
+    jq -nc --arg c "$CTX" '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $c}}'
     ;;
 
   guard)
@@ -322,35 +450,56 @@ case "$1" in
 
   stop)
     [ -d "$S" ] || exit 0
-    NOTES="$(get notes)"; BASE="$(get base none)"
+    ROOT="$(get root)"; NOTES="$(get notes)"; BASE="$(get base none)"; MODE="$(get mode task)"
     N=$(( $(get count 0) + 1 )); echo "$N" >"$S/count"
+    STATUS_LINE="$(grep -m1 -i '^Status:' "$NOTES" 2>/dev/null | sed -E 's/^[Ss][Tt][Aa][Tt][Uu][Ss]:[[:space:]]*//')"
+    STATUS="$(tr '[:upper:]' '[:lower:]' <<<"$STATUS_LINE")"
+
+    # Nothing valid left to do: let the turn end and switch off instead of burning quota.
+    if [[ "$STATUS" == idle* ]]; then
+      rm -rf "$S"
+      log "cycle $N idle -> turned off ($STATUS_LINE)"
+      jq -nc --arg m "Grindstone turned itself off: ${STATUS_LINE}. Notes: $NOTES" '{systemMessage: $m}'
+      exit 0
+    fi
+
+    # Progress = the notes changed or a new commit landed since the last cycle.
+    M="$(mtime "$NOTES")"; G="$(git_head "$ROOT")"
+    if [ "$M" = "$(get mtime)" ] && [ "$G" = "$(get head none)" ]; then STALE=$(( $(get stale 0) + 1 )); else STALE=0; fi
+    echo "$M" >"$S/mtime"; echo "$G" >"$S/head"; echo "$STALE" >"$S/stale"
+
+    if (( STALE >= STUCK_PAUSE )); then
+      rm -rf "$S"
+      log "cycle $N no progress for $STALE cycles -> paused"
+      jq -nc --arg m "Grindstone paused itself: no progress (no notes update or commit) for $STALE cycles in a row. Read the notes at $NOTES, then run /grindstone:on to resume." '{systemMessage: $m}'
+      exit 0
+    fi
+
     HEAD="[Grindstone · cycle $N] The user is away, so keep working without asking questions. Follow the playbook at $PLAYBOOK (re-read it if it isn't in your context). Notes: $NOTES."
 
-    # Track how many cycles in a row the notes have gone unchanged.
-    M="$(mtime "$NOTES")"
-    if [ "$M" = "$(get mtime)" ]; then STALE=$(( $(get stale 0) + 1 )); else STALE=0; fi
-    echo "$M" >"$S/mtime"; echo "$STALE" >"$S/stale"
-
-    STATUS="$(grep -m1 -i '^Status:' "$NOTES" 2>/dev/null | sed -E 's/^[Ss][Tt][Aa][Tt][Uu][Ss]:[[:space:]]*//' | tr '[:upper:]' '[:lower:]')"
-
     if [ ! -f "$NOTES" ]; then
-      MODE=init
+      KIND=init
       MSG="$HEAD Your notes file is missing. Recreate it from $TEMPLATE, rebuilding it from the conversation and git history, then carry on."
+    elif [[ "$STATUS" == saturated* ]] && [ "$MODE" != task ]; then
+      KIND=discover
+      MSG="$HEAD The current mission is saturated. Run Discovery mode again (see the playbook) to choose the next mission: fixes, health work or a planned feature. Record the finished mission under History, write the new one as the Goal, and set Status: working. If Discovery finds nothing valid, set Status: idle with the reason."
     elif [[ "$STATUS" == saturated* ]] || (( N % REVIEW_EVERY == 0 )); then
       L=$(get lens 0); echo $(( (L + 1) % ${#LENSES[@]} )) >"$S/lens"
       LENS="${LENSES[$L]}"
-      MODE="review:${LENS%%|*}"
+      KIND="review:${LENS%%|*}"
       DIFF=""; [ "$BASE" != none ] && DIFF=" Use \`git diff $BASE\` to see everything Grindstone has changed."
       MSG="$HEAD This is a REVIEW cycle. Lens: ${LENS%%|*}. ${LENS#*|}$DIFF Follow the playbook's review-cycle rules: score that Scorecard area with evidence, add your findings to the Backlog as scored items, re-rank the Backlog, and fix at most one P0/P1 finding."
     else
-      MODE=work
-      MSG="$HEAD Do one work cycle: orient, choose the highest-value item by the playbook's tiers, do it, verify it with evidence, record it in the notes, and add whatever you discovered to the Backlog."
+      KIND=work
+      MSG="$HEAD Do one work cycle: orient, choose the highest-value item by the playbook's tiers (for a planned feature, build its next milestone), do it, verify it with evidence, record it in the notes, and add whatever you discovered to the Backlog."
     fi
 
-    if (( STALE >= 2 )); then
+    if (( STALE >= STUCK_NUDGE )); then
+      MSG="$MSG You've made no recorded progress (no notes update and no commit) for $STALE cycles. Step back: are you blocked, looping, or out of work? Switch to a different Backlog item, run Discovery for a new mission, or, if nothing valid remains, set Status: idle with the reason. Grindstone pauses itself after $STUCK_PAUSE cycles without progress."
+    elif (( STALE >= 2 )); then
       MSG="$MSG Your notes haven't changed in $STALE cycles. Update Now, Log, Backlog and For the user before you do anything else."
     fi
-    log "cycle $N $MODE${STATUS:+ (status: $STATUS)}"
+    log "cycle $N $KIND${STATUS:+ (status: $STATUS)}"
     jq -nc --arg r "$MSG" '{decision: "block", reason: $r}'
     ;;
 
