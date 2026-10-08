@@ -1,0 +1,42 @@
+{
+  "name": "grindstone",
+  "displayName": "Grindstone",
+  "version": "1.0.0",
+  "description": "Keeps Claude working on and refining a task until you stop it: structured notes, value-based prioritisation, rotating review passes, auto-resume after usage limits, and a guard that keeps it inside the project folder.",
+  "author": {
+    "name": "Grindstone contributors"
+  },
+  "homepage": "https://github.com/JoshuaGessner/Grindstone",
+  "repository": "https://github.com/JoshuaGessner/Grindstone",
+  "license": "MIT",
+  "keywords": ["autonomous", "unattended", "overnight", "loop", "refine", "usage-limits", "guardrails"],
+  "userConfig": {
+    "retry_minutes": {
+      "type": "number",
+      "title": "Retry interval after a usage limit (minutes)",
+      "description": "While usage-limited, Grindstone retries this often until your limit resets. Failed retries don't use quota.",
+      "default": 15,
+      "min": 1,
+      "max": 120
+    },
+    "review_every": {
+      "type": "number",
+      "title": "Review every N cycles",
+      "description": "Every Nth cycle, Claude steps back and reviews the whole project through a rotating lens instead of taking the next task.",
+      "default": 5,
+      "min": 2,
+      "max": 50
+    },
+    "allow_remote": {
+      "type": "boolean",
+      "title": "Allow pushing and publishing",
+      "description": "Let Grindstone run git push, open PRs and publish. Off by default: commits stay on your machine.",
+      "default": false
+    },
+    "extra_allowed_paths": {
+      "type": "string",
+      "title": "Extra folders it may change",
+      "description": "Comma-separated folders Grindstone may change besides the project folder, e.g. ~/code/shared-lib. Leave empty to keep it inside the project."
+    }
+  }
+}

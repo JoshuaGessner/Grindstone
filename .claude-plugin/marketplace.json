@@ -1,0 +1,14 @@
+{
+  "name": "grindstone",
+  "description": "Grindstone: keep Claude working and refining until you stop it, safely inside your project.",
+  "owner": {
+    "name": "Grindstone contributors"
+  },
+  "plugins": [
+    {
+      "name": "grindstone",
+      "source": "./plugins/grindstone",
+      "description": "Keeps Claude working on and refining a task until you stop it, resumes after usage limits, and stays inside the project folder."
+    }
+  ]
+}
