@@ -23,6 +23,12 @@ Grindstone installs through Claude Code's built-in plugin manager, the same way 
 
 It's ready straight away, with no restart.
 
+**VS Code shortcut:** paste this link into your browser's address bar. It opens VS Code straight to Grindstone's install screen:
+
+```text
+vscode://anthropic.claude-code/install-plugin?plugin=grindstone&marketplace=JoshuaGessner/Grindstone
+```
+
 ### Terminal
 
 Paste this into a Claude Code session:
@@ -54,13 +60,25 @@ macOS or Linux (on Windows, use WSL), with `bash` and [`jq`](https://jqlang.org)
 
 ### Updates
 
-Claude Code doesn't auto-update plugins from community marketplaces unless you turn that on. To get updates automatically:
+Claude Code doesn't update plugins from community marketplaces like this one unless you ask it to, or turn on auto-update. Check the [releases page](https://github.com/JoshuaGessner/Grindstone/releases) for what's new.
 
-1. Open `/plugins` (or `/plugin` in the terminal).
-2. Go to the **Marketplaces** tab and select **grindstone**.
-3. Choose **Enable auto-update**.
+**Update now**
 
-To update just once, select Grindstone on the **Installed** tab and choose **Update now**.
+- **VS Code, Cursor, Windsurf or the desktop app:** paste this into any Claude chat:
+  > Run `claude plugin update grindstone@grindstone`
+- **Terminal:** run `/plugin`, open the **Installed** tab, select Grindstone and choose **Update now**.
+
+Then start a new chat, or run `/reload-plugins`, to load the new version.
+
+**Update automatically**
+
+- **VS Code, Cursor, Windsurf or the desktop app:** paste this into any Claude chat:
+  > In ~/.claude/settings.json, set `"autoUpdate": true` on the `grindstone` entry under `extraKnownMarketplaces`
+
+  Use a chat where Grindstone is off. Its guard blocks changes outside the project folder.
+- **Terminal:** run `/plugin`, open the **Marketplaces** tab, select **grindstone** and choose **Enable auto-update**.
+
+With auto-update on, Claude Code checks for a new version in the background a few minutes after you start a chat. The new version loads in your next chat.
 
 ## Use
 
