@@ -5,9 +5,14 @@
 #   guard    PreToolUse: blocks changes outside the project folder while on
 #   stop     Stop: while on, sends Claude into its next work, review or discovery cycle
 #   failure  StopFailure (asyncRewake): after a usage/rate limit, waits, then wakes Claude
-#   end      SessionEnd: clears the session's state
+#   session  SessionStart (compact|clear|resume): re-briefs Claude from the notes after a context reset
+#   wake     SessionStart (clear, asyncRewake): wakes Claude to carry on after /clear
+#   end      SessionEnd: parks the session's state (handed to the next session on /clear,
+#            restored on /resume) instead of throwing it away
 #
-# Per-session state: $DATA/sessions/<session_id>/{root,notes,base,mode,count,lens,mtime,head,stale}
+# Per-session state: $DATA/sessions/<session_id>/{root,notes,base,mode,count,lens,mtime,head,stale,ctxwarned}
+# Parked state:      $DATA/handoff/<old_session_id>/ (after /clear, kept 10 min)
+#                    $DATA/suspended/<session_id>/   (after the chat ends, kept 7 days)
 
 RES="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 DATA="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/grindstone-data}"
@@ -53,6 +58,11 @@ fi
 STUCK_NUDGE=4
 STUCK_PAUSE=8
 
+# Context size (tokens, from the transcript) at which Claude is told to checkpoint
+# its notes before a compaction wipes the details.
+CONTEXT_WARN="${GRINDSTONE_CONTEXT_WARN:-120000}"
+[[ "$CONTEXT_WARN" =~ ^[0-9]+$ ]] || CONTEXT_WARN=120000
+
 # Review lenses, rotated one per review cycle. "Name|what to look at".
 LENSES=(
   "Fresh-eyes goal check|Read the full diff since the base commit the way a strict reviewer seeing it for the first time would. Are the acceptance criteria really met, with evidence? Any regressions or leftovers?"
@@ -77,6 +87,60 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SESSION_ID:0:8} $*" >>"$LOG"; }
 get() { cat "$S/$1" 2>/dev/null || echo "$2"; }
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
 git_head() { git -C "$1" rev-parse HEAD 2>/dev/null || echo none; }
+
+# ---------------------------------------------------------------- context resets
+
+HANDOFF="$DATA/handoff"
+SUSPENDED="$DATA/suspended"
+
+# Drop parked state nobody came back for.
+prune() {
+  [ -d "$HANDOFF" ] && find "$HANDOFF" -mindepth 1 -maxdepth 1 -mmin +10 -exec rm -rf {} + 2>/dev/null
+  [ -d "$SUSPENDED" ] && find "$SUSPENDED" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+}
+
+# Non-empty lines of a "## Name" section of a notes file, up to N lines.
+section() {
+  awk -v h="## $2" -v max="$3" '
+    $0 == h { on = 1; next }
+    on && /^## / { exit }
+    on && NF { if (n++ < max) print }' "$1" 2>/dev/null
+}
+
+# What Claude needs to pick the work back up when its context has been compacted,
+# cleared or reloaded: the essentials of the notes, inline, plus how to resume.
+brief() {
+  local why="$1" notes root rows pre q now
+  notes="$(get notes)"; root="$(get root)"
+  echo "[Grindstone] $why Grindstone is still ON for this session (mode: $(get mode task), cycle $(get count 0)). Details of earlier turns are summarised or gone, so treat your notes as the source of truth, not your memory."
+  echo "Project folder: $root (change nothing outside it). Playbook: $PLAYBOOK. Notes: $notes."
+  echo "Before your next action: re-read the playbook and the full notes, run \`git status\` and \`git diff\` to find any half-finished edit, then continue from Now. Keep working without asking the user questions."
+  if [ ! -f "$notes" ]; then
+    echo "The notes file is missing. Recreate it from $TEMPLATE, rebuilding it from the conversation summary and git history."
+    return
+  fi
+  echo
+  echo "From your notes:"
+  grep -m1 '^Status:' "$notes"
+  echo "Goal:"; section "$notes" Goal 10 | cut -c1-220
+  now="$(section "$notes" Now 5 | cut -c1-220)"
+  echo "Now:"; echo "${now:-(empty: pick the top Backlog item)}"
+  rows="$(grep -E '^\|[[:space:]]*P[0-9]' "$notes" | head -5 | cut -c1-180)"
+  [ -n "$rows" ] && { echo "Top of the Backlog:"; echo "$rows"; }
+  pre="$(section "$notes" 'Pre-existing changes' 40 | grep -E '^- ' | head -12)"
+  [ -n "$pre" ] && { echo "The user's uncommitted files (don't edit, revert or commit them):"; echo "$pre"; }
+  q=$(section "$notes" 'Blocked / Questions for the user' 200 | grep -cE '^[-*] ')
+  (( q > 0 )) && echo "Open questions for the user: $q (don't wait for answers; work on other items)."
+}
+
+# Current context size in tokens, from the usage on the latest assistant message.
+context_tokens() {
+  local t; t="$(jq -r '.transcript_path // empty' <<<"$INPUT")"
+  [ -f "$t" ] || { echo 0; return; }
+  tail -n 300 "$t" | jq -R 'fromjson? | select(.type == "assistant") | .message.usage // empty
+      | (.input_tokens // 0) + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0)' 2>/dev/null \
+    | tail -1 | grep -E '^[0-9]+$' || echo 0
+}
 
 # ---------------------------------------------------------------- path guard
 
@@ -372,7 +436,7 @@ case "$1" in
     TASK="$(sed -E '1s#^[[:space:]]*/grindstone(:on|:off|:grindstone)?[[:space:]]*##' <<<"$TEXT")"
     WORD="$(tr -d '[:space:]' <<<"$TASK" | tr '[:upper:]' '[:lower:]')"
     if [ "$VERB" = :off ] || [[ "$WORD" =~ ^(off|stop|disable)$ ]]; then
-      rm -rf "$S"
+      rm -rf "$S" "$SUSPENDED/$SESSION_ID"
       log "OFF"
       exit 0
     fi
@@ -409,7 +473,8 @@ case "$1" in
     echo "$BASE" >"$S/base"
     echo "$MODE" >"$S/mode"
     git_head "$ROOT" >"$S/head"
-    echo 0 >"$S/count"; echo 0 >"$S/lens"; echo 0 >"$S/stale"
+    echo 0 >"$S/count"; echo 0 >"$S/lens"; echo 0 >"$S/stale"; echo 0 >"$S/ctxwarned"
+    rm -rf "$SUSPENDED/$SESSION_ID"
 
     if [ -f "$NOTES" ]; then
       STATE="Your notes file already exists. If the task has changed, update the Goal and acceptance criteria and re-plan the Backlog."
@@ -499,6 +564,21 @@ $(survey "$ROOT")"
     elif (( STALE >= 2 )); then
       MSG="$MSG Your notes haven't changed in $STALE cycles. Update Now, Log, Backlog and For the user before you do anything else."
     fi
+
+    # Context pressure: have Claude checkpoint its notes once before a compaction is likely.
+    TOK="$(context_tokens)"
+    if (( TOK >= CONTEXT_WARN )); then
+      if [ "$(get ctxwarned 0)" = 0 ]; then
+        echo 1 >"$S/ctxwarned"
+        KIND="$KIND+checkpoint"
+        MSG="$MSG Your context is large (about $(( TOK / 1000 ))k tokens), so a compaction is likely soon and will wipe the details of this conversation. Checkpoint first: make Now (with the exact next step and any half-finished edit), Backlog, Decisions, Project facts and For the user complete enough to resume from the notes alone. From here on, keep tool output small (head, tail, grep -n, line ranges) and hand broad searches to subagents."
+      fi
+    elif (( TOK < CONTEXT_WARN * 6 / 10 )); then
+      echo 0 >"$S/ctxwarned"
+    fi
+
+    NOW="$(section "$NOTES" Now 1 | cut -c1-200)"
+    [ -n "$NOW" ] && [[ "$NOW" != "("* ]] && MSG="$MSG (Now, per your notes: $NOW)"
     log "cycle $N $KIND${STATUS:+ (status: $STATUS)}"
     jq -nc --arg r "$MSG" '{decision: "block", reason: $r}'
     ;;
@@ -522,8 +602,67 @@ $(survey "$ROOT")"
     exit 2
     ;;
 
+  session)
+    SRC="$(jq -r '.source // empty' <<<"$INPUT")"
+    prune
+    case "$SRC" in
+      compact)
+        [ -d "$S" ] || exit 0
+        echo 0 >"$S/ctxwarned"
+        WHY="The conversation was just compacted."
+        ;;
+      clear)
+        # /clear starts a new session id: pick up the state the old one parked for this project.
+        [ -d "$S" ] && exit 0
+        ROOT="$(abspath "${CLAUDE_PROJECT_DIR:-$CWD}" /)"
+        FROM=""
+        for d in $(ls -t "$HANDOFF" 2>/dev/null); do
+          [ "$(cat "$HANDOFF/$d/root" 2>/dev/null)" = "$ROOT" ] && { FROM="$d"; break; }
+        done
+        [ -z "$FROM" ] && exit 0
+        mkdir -p "$SESSIONS" && mv "$HANDOFF/$FROM" "$S" || exit 0
+        log "carried over from ${FROM:0:8} after /clear"
+        WHY="The context was cleared with /clear."
+        ;;
+      resume)
+        [ -d "$SUSPENDED/$SESSION_ID" ] || exit 0
+        [ -d "$S" ] || mv "$SUSPENDED/$SESSION_ID" "$S" || exit 0
+        log "restored on resume"
+        WHY="This conversation was resumed. If the user wants Grindstone to stop, they'll send /grindstone:off."
+        ;;
+      *) exit 0 ;;
+    esac
+    # A reset isn't a stall: restart the progress tracking from here.
+    R="$(get root)"
+    mtime "$(get notes)" >"$S/mtime"; git_head "$R" >"$S/head"; echo 0 >"$S/stale"; echo 0 >"$S/ctxwarned"
+    log "re-briefed after $SRC"
+    jq -nc --arg c "$(brief "$WHY")" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $c}}'
+    ;;
+
+  wake)
+    # Runs in the background after /clear: once the state has been carried over, wake
+    # Claude so the work continues without the user typing anything.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ -d "$S" ] && break
+      sleep 0.5
+    done
+    [ -d "$S" ] || exit 0
+    sleep "${GRINDSTONE_WAKE_DELAY:-2}"
+    [ -d "$S" ] || exit 0
+    log "waking after /clear"
+    echo "[Grindstone] The context was cleared with /clear, but Grindstone is still on. Re-read the playbook ($PLAYBOOK) and your notes ($(get notes)), check \`git status\` and \`git diff\`, then continue from Now. (The user can stop this with /grindstone:off.)" >&2
+    exit 2
+    ;;
+
   end)
-    rm -rf "$S"
+    # Park the state instead of deleting it: /clear hands it to the next session,
+    # and /resume (or reopening the chat) restores it.
+    [ -d "$S" ] || exit 0
+    REASON="$(jq -r '.reason // "other"' <<<"$INPUT")"
+    if [ "$REASON" = clear ]; then DEST="$HANDOFF/$SESSION_ID"; else DEST="$SUSPENDED/$SESSION_ID"; fi
+    mkdir -p "$(dirname "$DEST")" && rm -rf "$DEST" && mv "$S" "$DEST" && touch "$DEST"
+    log "session ended ($REASON): state parked"
+    prune
     ;;
 esac
 exit 0

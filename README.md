@@ -127,6 +127,13 @@ Within a tier it picks the highest *impact × confidence ÷ effort*. Rules again
 
 **Usage limits.** When a turn fails on a usage or rate limit, Grindstone retries every 15 minutes until your limit resets. Failed retries don't use quota. On the first retry that succeeds, Claude re-reads its notes and continues.
 
+**Context resets.** Long runs fill up Claude's context, and Claude Code then compacts it (summarises the conversation), which loses detail. Grindstone is built so that doesn't derail the work:
+
+- **Checkpoint before compaction.** When the context gets large, Claude is told once to bring its notes fully up to date, including the exact next step and any half-finished edit, and to keep tool output small from then on.
+- **Re-brief after compaction.** Right after a compaction, Claude gets a brief built from its notes: the goal, the current step, the top of the backlog, your uncommitted files, and how to resume (re-read notes, check `git status` and `git diff`). Every cycle also repeats the notes' current step.
+- **`/clear` doesn't stop it.** Clearing the chat hands Grindstone over to the fresh context with the same notes, and Claude carries on by itself. Use `/grindstone:off` if you want it to stop.
+- **Closing and reopening a chat.** If a chat ends while Grindstone is on, resuming that chat within 7 days turns Grindstone back on where it left off.
+
 ## Safety guard
 
 While Grindstone is on in a chat, a guard checks every tool call. It blocks:

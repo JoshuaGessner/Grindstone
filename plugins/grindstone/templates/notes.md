@@ -19,7 +19,7 @@ __TASK__
 
 ## Now
 
-(The single item in progress, with the step you're on.)
+(The single item in progress, the exact next step, and any half-finished edit. Keep this current: it's how you resume after a context reset.)
 
 ## Backlog
 

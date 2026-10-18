@@ -1,7 +1,7 @@
 {
   "name": "grindstone",
   "displayName": "Grindstone",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Keeps Claude working until you stop it: give it a task, or none and it finds valuable work itself (fixes, health work, planned features). Structured notes, value-based prioritisation, rotating reviews, auto-resume after usage limits, and a guard that keeps it inside the project folder.",
   "author": {
     "name": "Grindstone contributors"

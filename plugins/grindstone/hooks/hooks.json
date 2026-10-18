@@ -34,6 +34,25 @@
         ]
       }
     ],
+    "SessionStart": [
+      {
+        "matcher": "compact|clear|resume",
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/grindstone-hook.sh\" session" }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/grindstone-hook.sh\" wake",
+            "asyncRewake": true,
+            "timeout": 60
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

@@ -244,6 +244,85 @@ has "empty folder survey" "$ctx" "The project folder is empty"
 has "empty folder not a repo" "$ctx" "Self-directed"
 send prompt '{prompt_text: "/grindstone:off"}' >/dev/null
 
+# ================================================================ context resets
+usage() { jq -nc --argjson n "$1" '{type: "assistant", message: {usage: {input_tokens: 5, cache_read_input_tokens: ($n - 5), cache_creation_input_tokens: 0}}}'; }
+edit_notes() { sed -e "$1" "$(notes)" >"$(notes).new" && mv "$(notes).new" "$(notes)"; }
+
+SID=clearold0001
+TRANSCRIPT="$TMP/ctx.jsonl"; : >"$TRANSCRIPT"
+enable "/grindstone:on Add CSV export to the reports page" >/dev/null
+edit_notes 's/^(The single item in progress.*/Wire the export button to exportCsv() in src\/report.js (handler written, not hooked up yet)/'
+edit_notes 's/^|---|------|.*/&\
+| P1 | Export button | users asked for it | 3 | 3 | 1 | 9 |/'
+
+# compaction: Claude gets a brief built from the notes
+ctx="$(send session '{source: "compact"}' | jq -r '.hookSpecificOutput.additionalContext // empty')"
+has "compact: says what happened" "$ctx" "just compacted"
+has "compact: goal" "$ctx" "Add CSV export to the reports page"
+has "compact: now" "$ctx" "Wire the export button"
+has "compact: backlog" "$ctx" "| P1 | Export button"
+has "compact: user's files" "$ctx" "src/a.js"
+has "compact: how to resume" "$ctx" "git diff"
+check "compact: nothing for sessions without Grindstone" "$(SID=someoneelse send session '{source: "compact"}')" ""
+
+# each cycle carries the current step; a large context triggers one checkpoint request
+touch_notes; r="$(stop | jq -r .reason)"
+has "cycle shows Now" "$r" "(Now, per your notes: Wire the export button"
+hasnt "no checkpoint on a small context" "$r" "Your context is large"
+usage 130000 >>"$TRANSCRIPT"
+touch_notes; r="$(stop | jq -r .reason)"
+has "checkpoint at 130k tokens" "$r" "Your context is large (about 130k tokens)"
+touch_notes; hasnt "checkpoint asked only once" "$(stop | jq -r .reason)" "Your context is large"
+usage 40000 >>"$TRANSCRIPT"
+touch_notes; stop >/dev/null
+usage 135000 >>"$TRANSCRIPT"
+touch_notes; has "checkpoint again after context shrank" "$(stop | jq -r .reason)" "Your context is large"
+send session '{source: "compact"}' >/dev/null
+touch_notes; has "checkpoint re-armed by compaction" "$(stop | jq -r .reason)" "Your context is large"
+: >"$TRANSCRIPT"
+CYCLES="$(cat "$CLAUDE_PLUGIN_DATA/sessions/$SID/count")"
+
+# /clear in another project doesn't pick up this project's Grindstone
+send end '{reason: "clear"}'
+[ -d "$CLAUDE_PLUGIN_DATA/handoff/clearold0001" ] && ok || bad "/clear: state not parked"
+check "/clear: old session no longer active" "$(stop)" ""
+SID=otherproj001
+check "/clear: other project ignored" \
+  "$(event | jq -c --arg c "$E" '. + {cwd: $c, source: "clear"}' | CLAUDE_PROJECT_DIR="$E" bash "$H" session)" ""
+
+# /clear in the same project: the new session carries on with the same notes
+SID=clearnew0001
+ctx="$(send session '{source: "clear"}' | jq -r '.hookSpecificOutput.additionalContext // empty')"
+has "/clear: carried over" "$ctx" "cleared with /clear"
+has "/clear: same goal" "$ctx" "Add CSV export to the reports page"
+has "/clear: same notes file" "$ctx" "notes-clearold.md"
+[ -d "$CLAUDE_PLUGIN_DATA/handoff/clearold0001" ] && bad "/clear: handoff not consumed" || ok
+T=$((T + 1)); touch -m -t "$T" "$P/.claude/grindstone/notes-clearold.md"
+has "/clear: cycle count continues" "$(stop | jq -r .reason)" "cycle $((CYCLES + 1))]"
+err="$(event | jq -c '. + {source: "clear"}' | GRINDSTONE_WAKE_DELAY=0 bash "$H" wake 2>&1 >/dev/null)"; code=$?
+check "/clear: wake exit code" "$code" "2"
+has "/clear: wake message" "$err" "cleared with /clear, but Grindstone is still on"
+
+# closing the chat parks the state; resuming it restores Grindstone
+send end '{reason: "other"}'
+check "ended: inactive" "$(stop)" ""
+ctx="$(send session '{source: "resume"}' | jq -r '.hookSpecificOutput.additionalContext // empty')"
+has "resume: restored" "$ctx" "This conversation was resumed"
+[[ "$(stop | jq -r .reason)" == *"[Grindstone · cycle"* ]] && ok || bad "resume: cycles continue"
+
+# /grindstone:off also forgets the parked state
+send end '{reason: "prompt_input_exit"}'
+send prompt '{prompt_text: "/grindstone:off"}' >/dev/null
+check "off forgets parked state" "$(send session '{source: "resume"}')" ""
+
+# stale parked state is cleaned up
+mkdir -p "$CLAUDE_PLUGIN_DATA/handoff/stale0000001" "$CLAUDE_PLUGIN_DATA/suspended/stale0000002"
+touch -t 202001010000 "$CLAUDE_PLUGIN_DATA/handoff/stale0000001" "$CLAUDE_PLUGIN_DATA/suspended/stale0000002"
+SID=prune0000001 send session '{source: "startup"}' >/dev/null
+[ -e "$CLAUDE_PLUGIN_DATA/handoff/stale0000001" ] && bad "old handoff not pruned" || ok
+[ -e "$CLAUDE_PLUGIN_DATA/suspended/stale0000002" ] && bad "old suspended state not pruned" || ok
+TRANSCRIPT=""
+
 # refuses to run from the home folder
 ctx="$(jq -nc --arg h "$HOME" '{session_id: "homecase", cwd: $h, prompt_text: "/grindstone:on x"}' \
         | CLAUDE_PROJECT_DIR="$HOME" bash "$H" prompt | jq -r .hookSpecificOutput.additionalContext)"

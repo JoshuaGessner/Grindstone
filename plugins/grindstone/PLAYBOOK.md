@@ -110,6 +110,17 @@ Step back from the queue. Look at the whole project through the lens the hook na
 - **Idle:** nothing valid is left to do on your own. Set `Status: idle — <reason>` and write a final **For the user** summary first. Grindstone then switches itself off.
 - **Stuck:** if the hook says you've made no progress for several cycles, believe it. Change approach, change item, or go idle. After 8 cycles without progress, Grindstone pauses itself.
 
+## Context hygiene
+
+Your context will be compacted, and the user may clear it with `/clear`. Either way, details of earlier turns disappear. Work so that losing them costs nothing:
+
+- **The notes are your memory.** Before any long step, write the exact next step and any half-finished edit into **Now**. After every cycle, the notes must be enough to resume from on their own.
+- **After a context reset** (the hook tells you when one happened and gives you a brief from your notes): re-read this playbook and the full notes, run `git status` and `git diff` to find half-finished edits, then continue from Now. Don't redo work the Log says is done, and don't trust half-remembered details over the notes.
+- **When the hook warns that the context is large**, checkpoint the notes immediately.
+- **Keep tool output small.** Use `head`, `tail`, `grep -n` and line ranges instead of printing whole files or logs. Run tests with quiet or summary flags and read only the failures. Write the conclusion of a long investigation into the notes rather than leaving it in the conversation.
+- **Hand broad exploration to subagents** (searching many files, surveying a large codebase, digging through logs), so only their conclusions enter your context.
+- **Commit often**, so `git log` holds the story too.
+
 ## Keeping the notes tidy
 
 - Keep the file under about 250 lines. Keep the newest 15 Log entries and fold older ones into single lines under History.
